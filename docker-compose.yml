@@ -1,0 +1,11 @@
+services:
+  wind-forecast-intelligence:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      LOG_LEVEL: "INFO"
+    restart: unless-stopped
