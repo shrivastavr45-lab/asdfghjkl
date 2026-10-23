@@ -1,8 +1,10 @@
-"""FastAPI application serving JSON endpoints and built React assets."""
+"""FastAPI application serving typed JSON endpoints and built React assets."""
 from __future__ import annotations
 
 import logging
 import os
+import time
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -11,13 +13,48 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import router
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+)
 logger = logging.getLogger("wind_forecast_intelligence")
+
 app = FastAPI(
     title="Wind Forecast Intelligence API",
-    description="Evaluates Elexon wind forecasts against actual generation for January 2026.",
-    version="1.0.0",
+    description="Evaluates Elexon national wind forecasts against actual generation for January 2026 with quantified risk metrics.",
+    version="1.1.0",
 )
+
+
+@app.middleware("http")
+async def request_logging_and_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    t0 = time.monotonic()
+    try:
+        response = await call_next(request)
+        duration_ms = (time.monotonic() - t0) * 1000.0
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "%s %s -> %s (%.1fms) [req_id=%s]",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            request_id,
+        )
+        return response
+    except Exception:
+        duration_ms = (time.monotonic() - t0) * 1000.0
+        logger.exception(
+            "Unhandled exception during %s %s (%.1fms) [req_id=%s]",
+            request.method,
+            request.url.path,
+            duration_ms,
+            request_id,
+        )
+        raise
+
+
 app.include_router(router)
 
 STATIC_DIR = Path(os.getenv("STATIC_DIR", str(Path(__file__).parent / "static")))

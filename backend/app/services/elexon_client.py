@@ -1,21 +1,24 @@
-"""Small, defensive client for the two approved Elexon dataset streams.
+"""Hardened, defensive client for the two approved Elexon dataset streams.
 
 Both dataset stream endpoints filter on publication timestamps. Delivery dates
 and fuel types are filtered locally after retrieving the bounded stream window.
+Includes exponential backoff retries for 429 / 5xx, structured logging, and timeout safety.
 """
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
 
 BASE_URL = "https://data.elexon.co.uk/bmrs/api/v1"
-TIMEOUT_SECONDS = 25
-USER_AGENT = "WindForecastIntelligence/1.0 (educational analytics dashboard)"
+TIMEOUT_SECONDS = 30
+USER_AGENT = "WindForecastIntelligence/1.1 (educational analytics dashboard; retry-hardened)"
 FORECAST_LOOKBACK_DAYS = 14
 ACTUAL_REVISION_WINDOW_DAYS = 14
+MAX_RETRIES = 3
 logger = logging.getLogger(__name__)
 
 
@@ -53,12 +56,7 @@ def _unwrap_rows(payload: Any, dataset: str) -> list[dict[str, Any]]:
 
 
 def _dataset_params(dataset: str, from_time: datetime, to_time: datetime) -> dict[str, str]:
-    """Build documented publication-time filters for the approved datasets.
-
-    The Elexon dataset-stream API filters these streams by publication time.
-    Delivery-period filtering and FUELHH fuel-type filtering are therefore done
-    locally after the response is validated.
-    """
+    """Build documented publication-time filters for the approved datasets."""
     if dataset in {"FUELHH", "WINDFOR"}:
         return {
             "publishDateTimeFrom": iso_utc(from_time),
@@ -67,35 +65,69 @@ def _dataset_params(dataset: str, from_time: datetime, to_time: datetime) -> dic
     raise ValueError("Only FUELHH and WINDFOR are permitted data sources.")
 
 
+def _http_get_with_retry(url: str, params: dict[str, str], dataset: str) -> requests.Response:
+    """Execute GET request with retry backoff on transient 429 and 5xx errors."""
+    backoff = 1.0
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+
+    for attempt in range(MAX_RETRIES):
+        t0 = time.monotonic()
+        try:
+            response = requests.get(url, params=params, timeout=TIMEOUT_SECONDS, headers=headers)
+            duration_ms = (time.monotonic() - t0) * 1000.0
+
+            # If transient 429 or 5xx, retry with backoff if attempts remain
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < (MAX_RETRIES - 1):
+                logger.warning(
+                    "Elexon %s returned HTTP %s on attempt %d; retrying in %.1fs...",
+                    dataset,
+                    response.status_code,
+                    attempt + 1,
+                    backoff,
+                )
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+
+            if response.status_code == 429:
+                raise ElexonAPIError(
+                    f"Elexon rate-limited the {dataset} request (HTTP 429). Wait briefly, then refresh."
+                )
+
+            response.raise_for_status()
+            logger.info("Elexon %s fetch completed in %.1fms with HTTP %s", dataset, duration_ms, response.status_code)
+            return response
+        except ElexonAPIError:
+            raise
+        except requests.Timeout as exc:
+            if attempt < (MAX_RETRIES - 1):
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            logger.error("Elexon %s timed out after %ds", dataset, TIMEOUT_SECONDS)
+            raise ElexonAPIError(
+                f"The Elexon {dataset} request timed out after {TIMEOUT_SECONDS} seconds."
+            ) from exc
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            suffix = f" (HTTP {status})" if status else ""
+            if attempt < (MAX_RETRIES - 1) and status in (500, 502, 503, 504):
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            logger.warning("Elexon %s request failed%s: %s", dataset, suffix, type(exc).__name__)
+            raise ElexonAPIError(
+                f"Could not retrieve Elexon dataset {dataset}{suffix}. Check network/API availability and retry."
+            ) from exc
+
+    raise ElexonAPIError(f"Could not retrieve Elexon dataset {dataset} after {MAX_RETRIES} attempts.")
+
+
 def fetch_stream(dataset: str, from_time: datetime, to_time: datetime) -> list[dict[str, Any]]:
     """Fetch a bounded range from an official, documented Elexon stream."""
     params = _dataset_params(dataset, from_time, to_time)
     url = f"{BASE_URL}/datasets/{dataset}/stream"
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            timeout=TIMEOUT_SECONDS,
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-        )
-        if response.status_code == 429:
-            raise ElexonAPIError(
-                f"Elexon rate-limited the {dataset} request (HTTP 429). Wait briefly, then refresh."
-            )
-        response.raise_for_status()
-    except ElexonAPIError:
-        raise
-    except requests.Timeout as exc:
-        raise ElexonAPIError(
-            f"The Elexon {dataset} request timed out after {TIMEOUT_SECONDS} seconds."
-        ) from exc
-    except requests.RequestException as exc:
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        suffix = f" (HTTP {status})" if status else ""
-        logger.warning("Elexon %s request failed%s: %s", dataset, suffix, type(exc).__name__)
-        raise ElexonAPIError(
-            f"Could not retrieve Elexon dataset {dataset}{suffix}. Check network/API availability and retry."
-        ) from exc
+    response = _http_get_with_retry(url, params, dataset)
 
     try:
         payload = response.json()
@@ -105,14 +137,7 @@ def fetch_stream(dataset: str, from_time: datetime, to_time: datetime) -> list[d
 
 
 def fetch_day_actuals(delivery_date: date) -> list[dict[str, Any]]:
-    """Retrieve FUELHH revisions over a bounded publication-time window.
-
-    FUELHH is filtered by publication time, not settlement date. Start at the
-    delivery day's midnight and allow a 14-day revision window after delivery;
-    normalization later filters to the selected delivery date and fuelType=WIND.
-    The bounded window is an explicit MVP assumption to avoid downloading an
-    unbounded history of published revisions for a single delivery day.
-    """
+    """Retrieve FUELHH revisions over a bounded publication-time window."""
     start = datetime(delivery_date.year, delivery_date.month, delivery_date.day, tzinfo=timezone.utc)
     return fetch_stream(
         "FUELHH",
@@ -122,15 +147,7 @@ def fetch_day_actuals(delivery_date: date) -> list[dict[str, Any]]:
 
 
 def fetch_day_forecasts(delivery_date: date) -> list[dict[str, Any]]:
-    """Retrieve forecast vintages published over a bounded lookback horizon.
-
-    WINDFOR filters by publication time, not delivery time. Fetch publications
-    from 14 days before delivery through the end of the delivery date, then
-    locally retain only rows whose startTime belongs to the selected delivery
-    date. Fourteen days is the forecast-lookback assumption for this MVP; it is
-    explicit here and in the README rather than being silently inferred from a
-    delivery-time filter. The selected decision cutoff is applied downstream.
-    """
+    """Retrieve forecast vintages published over a bounded lookback horizon."""
     start = datetime(delivery_date.year, delivery_date.month, delivery_date.day, tzinfo=timezone.utc)
     return fetch_stream(
         "WINDFOR",
